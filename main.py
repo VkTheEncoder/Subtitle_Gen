@@ -743,13 +743,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
     end_sec   = min(end_sec if end_sec is not None else duration, duration)
     proc_dur  = end_sec - start_sec
 
-    requested_fps = float(os.getenv("OCR_FPS", "0"))
-
-    extract_fps = (
-        fps
-        if requested_fps <= 0
-        else min(fps, requested_fps)
-    )
+    extract_fps = fps
     total_frames = int(proc_dur * extract_fps)
 
     OCR_SCAN_WIDTH = max(320, int(os.getenv("OCR_SCAN_WIDTH", "1280")))
