@@ -389,7 +389,7 @@ def _load_ocr(gpu_id: int = 0):
                     show_log=False,
                     det_db_box_thresh=0.5,
                     rec_batch_num=32,      
-                    cpu_threads=4,
+                    cpu_threads=2,
                 )
                 log.info(f"PaddleOCR ready GPU:{gpu_id} (pid={os.getpid()})")
                 break
