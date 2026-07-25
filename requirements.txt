@@ -1,0 +1,13 @@
+# Python 3.10 environment recommended for PaddleOCR 2.x
+setuptools<81
+wheel
+numpy==1.26.4
+protobuf==3.20.2
+paddleocr==2.7.3
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+aiohttp>=3.9.5,<4
+requests>=2.31.0,<3
+yt-dlp>=2025.1.15
+openai>=1.40.0,<3
+nest-asyncio==1.6.0
