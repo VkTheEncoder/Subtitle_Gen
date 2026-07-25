@@ -396,7 +396,6 @@ def _load_ocr(gpu_id: int = 0):
             except Exception as e:
                 last_err = e
                 log.warning(f"PaddleOCR init attempt {attempt} failed: {e}")
-                shutil.rmtree(os.path.expanduser("~/.paddleocr"), ignore_errors=True)
                 time.sleep(2)
         else:
             log.warning(f"GPU OCR init failed after 3 attempts: {last_err}")
