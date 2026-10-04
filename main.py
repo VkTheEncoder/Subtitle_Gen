@@ -679,16 +679,16 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
     proc.stdout.close(); proc.wait()
     return cues
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Frame-stream processor
+# ══════════════════════════════════════════════════════════════════════════════
 def _make_extract_cmd(video_path: str, ss: float, dur: float,
-                       s_w: int, s_h: int, extract_fps: float,
-                       gpu_id: int = 0, use_hwaccel: bool = True) -> list:
-    cmd = ["ffmpeg", "-v", "warning", "-y"]
-    if use_hwaccel:
-        cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id)]
-
-    cmd += [
+                       s_w: int, s_h: int, extract_fps: float) -> list:
+    """Universal raw BGR frame extractor (100% compatible with 8-bit & 10-bit HEVC/AVC)."""
+    return [
+        "ffmpeg", "-v", "error", "-y",
         "-ss", str(ss),
-        "-i", video_path,
+        "-i", str(video_path),
         "-t", str(dur),
         "-vf", f"scale={s_w}:{s_h}:flags=lanczos,format=bgr24",
         "-r", str(extract_fps),
@@ -696,18 +696,94 @@ def _make_extract_cmd(video_path: str, ss: float, dur: float,
         "-pix_fmt", "bgr24",
         "-"
     ]
-    return cmd
+
+def _process_frame_stream(engine, cmd: list, bpf: int,
+                           frame_h: int, frame_w: int,
+                           extract_fps: float, time_offset: float,
+                           cancel_check, progress_cb=None) -> list:
+    cues: list = []
+    fq: queue.Queue = queue.Queue(maxsize=512)
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, bufsize=10**8)
+
+    def _reader():
+        idx = 0
+        while True:
+            if cancel_check():
+                proc.terminate()
+                break
+            raw = proc.stdout.read(bpf)
+            if not raw or len(raw) != bpf:
+                break
+            fq.put((idx, raw))
+            idx += 1
+        fq.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+    frame_dur = 1.0 / extract_fps
+    frames_processed = 0
+
+    while True:
+        item = fq.get()
+        if item is None:
+            break
+        idx, raw = item
+        frames_processed += 1
+        cur_t = round((idx / extract_fps) + time_offset, 3)
+        if progress_cb:
+            progress_cb(idx, cues)
+
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((frame_h, frame_w, 3))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mn, mx = cv2.minMaxLoc(gray)[:2]
+        if mx < 50:
+            continue
+
+        lines = _extract_text_paddle(engine, frame)
+
+        for pts, (raw_text, conf) in lines:
+            if conf < 0.15:
+                continue
+            raw_text = raw_text.strip()
+            cmp_text = _norm(raw_text)
+            if not cmp_text:
+                continue
+
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            bg = _sample_bg_color(frame, xs, ys)
+            cues.append({
+                "start": cur_t,
+                "end":   round(cur_t + frame_dur, 3),
+                "text":  raw_text,
+                "cmp":   cmp_text,
+                "conf":  conf,
+                "x":     float(sum(xs) / len(xs)),
+                "y":     float(sum(ys) / len(ys)),
+                "bw":    float(max(xs) - min(xs)),
+                "bh":    float(max(ys) - min(ys)),
+                "bg":    bg,
+            })
+
+    proc.stdout.close()
+    _, stderr_err = proc.communicate()
+
+    # Catch silent FFmpeg crashes so they don't produce empty subtitle lists
+    if frames_processed == 0 and proc.returncode not in (0, None):
+        err_msg = stderr_err.decode(errors="replace")
+        raise RuntimeError(f"FFmpeg worker exited with error (rc={proc.returncode}):\n{err_msg}")
+
+    return cues
 
 def _mp_ocr_worker(idx: int, video_path: str, ss: float, dur: float,
                     bpf: int, s_w: int, s_h: int, extract_fps: float,
-                    progress_q, result_q, cancel_val, use_hwaccel: bool = True):
+                    progress_q, result_q, cancel_val):
     try:
         gpu_id = idx % max(NUM_GPUS, 1)
         engine = _load_ocr(gpu_id)
-        cmd = _make_extract_cmd(
-            video_path, ss, dur, s_w, s_h, extract_fps,
-            gpu_id=gpu_id, use_hwaccel=use_hwaccel
-        )
+        cmd = _make_extract_cmd(video_path, ss, dur, s_w, s_h, extract_fps)
         cancel_check = lambda: cancel_val.value != 0
         cues = _process_frame_stream(
             engine, cmd, bpf, s_h, s_w, extract_fps, ss, cancel_check,
@@ -764,22 +840,16 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
          f"Scanning 100% of {total_frames:,} frames…",
          CANCEL_BTN)
 
-    # ── Test pipe: Test at ss=0.0 to verify geometry without seek artifacts ──
-    use_hwaccel = True
-    _test_cmd = _make_extract_cmd(video_path, 0.0, 1.0, s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=True)
+    # ── Test pipe: verify pipe geometry with 1 frame at start ──
+    _test_cmd = _make_extract_cmd(video_path, 0.0, 1.0, s_w, s_h, extract_fps)
     _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _raw, _err_b = _tp.communicate()
-    _err = _err_b.decode(errors="replace")
+    _raw = _tp.stdout.read(bpf)
+    _tp.stdout.close()
+    _tp.wait()
 
-    if len(_raw) < bpf:
-        log.warning(f"CUDA hwaccel frame pipe failed (rc={_tp.returncode}). Falling back to CPU decoding.")
-        use_hwaccel = False
-        _test_cmd = _make_extract_cmd(video_path, 0.0, 1.0, s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=False)
-        _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _raw, _err_b = _tp.communicate()
-        _err = _err_b.decode(errors="replace")
-        if len(_raw) < bpf:
-            raise RuntimeError(f"FFmpeg pipe geometry mismatch (rc={_tp.returncode}). stderr:\n{_err}")
+    if len(_raw) != bpf:
+        _err = _tp.stderr.read().decode(errors="replace")
+        raise RuntimeError(f"FFmpeg pipe geometry mismatch. stderr:\n{_err}")
 
     progress_q = _MP_CTX.Queue()
     result_q   = _MP_CTX.Queue()
@@ -797,7 +867,7 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
         p = _MP_CTX.Process(
             target=_mp_ocr_worker,
             args=(i, video_path, chunk_start, chunk_length, bpf, s_w, s_h, extract_fps,
-                  progress_q, result_q, cancel_val, use_hwaccel),
+                  progress_q, result_q, cancel_val),
             daemon=True,
         )
         p.start()
