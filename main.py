@@ -681,20 +681,19 @@ def _process_frame_stream(engine, cmd: list, bpf: int,
 
 def _make_extract_cmd(video_path: str, ss: float, dur: float,
                        s_w: int, s_h: int, extract_fps: float,
-                       thr: str = "2", gpu_id: int = 0, use_hwaccel: bool = True) -> list:
-    cmd = ["ffmpeg", "-v", "error", "-y"]
+                       gpu_id: int = 0, use_hwaccel: bool = True) -> list:
+    cmd = ["ffmpeg", "-v", "warning", "-y"]
     if use_hwaccel:
         cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id)]
-    
+
     cmd += [
         "-ss", str(ss),
         "-i", video_path,
         "-t", str(dur),
-        "-vf", f"scale={s_w}:{s_h}:flags=lanczos",
+        "-vf", f"scale={s_w}:{s_h}:flags=lanczos,format=bgr24",
         "-r", str(extract_fps),
-        "-f", "image2pipe",
+        "-f", "rawvideo",
         "-pix_fmt", "bgr24",
-        "-vcodec", "rawvideo",
         "-"
     ]
     return cmd
@@ -706,7 +705,8 @@ def _mp_ocr_worker(idx: int, video_path: str, ss: float, dur: float,
         gpu_id = idx % max(NUM_GPUS, 1)
         engine = _load_ocr(gpu_id)
         cmd = _make_extract_cmd(
-            video_path, ss, dur, s_w, s_h, extract_fps, gpu_id=gpu_id, use_hwaccel=use_hwaccel
+            video_path, ss, dur, s_w, s_h, extract_fps,
+            gpu_id=gpu_id, use_hwaccel=use_hwaccel
         )
         cancel_check = lambda: cancel_val.value != 0
         cues = _process_frame_stream(
@@ -764,23 +764,22 @@ def run_ocr_pipeline(video_path: str, status_msg, chat_id: int,
          f"Scanning 100% of {total_frames:,} frames…",
          CANCEL_BTN)
 
-    # ── Test pipe: Try CUDA hwaccel first, fall back to CPU for 10-bit HEVC / 4K ──
+    # ── Test pipe: Test at ss=0.0 to verify geometry without seek artifacts ──
     use_hwaccel = True
-    _test_cmd = _make_extract_cmd(video_path, start_sec, min(2.0, proc_dur), s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=True)
-    _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=bpf * 4)
-    _raw = _tp.stdout.read(bpf)
-    _tp.stdout.close(); _tp.wait()
+    _test_cmd = _make_extract_cmd(video_path, 0.0, 1.0, s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=True)
+    _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _raw, _err_b = _tp.communicate()
+    _err = _err_b.decode(errors="replace")
 
-    if len(_raw) != bpf:
-        log.warning("CUDA hwaccel frame pipe failed (10-bit HEVC or non-standard stream). Falling back to CPU decoding.")
+    if len(_raw) < bpf:
+        log.warning(f"CUDA hwaccel frame pipe failed (rc={_tp.returncode}). Falling back to CPU decoding.")
         use_hwaccel = False
-        _test_cmd = _make_extract_cmd(video_path, start_sec, min(2.0, proc_dur), s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=False)
-        _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=bpf * 4)
-        _raw = _tp.stdout.read(bpf)
-        _err = _tp.stderr.read().decode(errors="replace")
-        _tp.stdout.close(); _tp.wait()
-        if len(_raw) != bpf:
-            raise RuntimeError(f"FFmpeg pipe geometry mismatch. stderr:\n{_err}")
+        _test_cmd = _make_extract_cmd(video_path, 0.0, 1.0, s_w, s_h, extract_fps, gpu_id=0, use_hwaccel=False)
+        _tp = subprocess.Popen(_test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _raw, _err_b = _tp.communicate()
+        _err = _err_b.decode(errors="replace")
+        if len(_raw) < bpf:
+            raise RuntimeError(f"FFmpeg pipe geometry mismatch (rc={_tp.returncode}). stderr:\n{_err}")
 
     progress_q = _MP_CTX.Queue()
     result_q   = _MP_CTX.Queue()
